@@ -73,8 +73,14 @@ class SRModel(BaseModel):
         else:
             self.cri_perceptual = None
 
-        if self.cri_pix is None and self.cri_frequency is None and self.cri_perceptual is None:
-            raise ValueError('Pixel, frequency, and perceptual losses are all None.')
+        if train_opt.get('wavelet_opt'):
+            self.cri_wavelet = build_loss(train_opt['wavelet_opt']).to(self.device)
+        else:
+            self.cri_wavelet = None
+
+        if (self.cri_pix is None and self.cri_frequency is None and
+                self.cri_perceptual is None and self.cri_wavelet is None):
+            raise ValueError('Pixel, frequency, perceptual, and wavelet losses are all None.')
 
         # set up optimizers and schedulers
         self.setup_optimizers()
@@ -102,7 +108,12 @@ class SRModel(BaseModel):
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            self.output = self.net_g(self.lq)
+            network_output = self.net_g(self.lq, return_details=True)
+            if isinstance(network_output, tuple):
+                self.output, self.detail_output = network_output
+            else:
+                self.output = network_output
+                self.detail_output = None
 
             l_total = 0
             loss_dict = OrderedDict()
@@ -115,6 +126,13 @@ class SRModel(BaseModel):
                 l_frequency = self.cri_frequency(self.output, self.gt)
                 l_total += l_frequency
                 loss_dict['l_frequency'] = l_frequency
+            if self.cri_wavelet:
+                if self.detail_output is None:
+                    raise RuntimeError(
+                        'wavelet_opt is enabled but network_g did not return detail coefficients')
+                l_wavelet = self.cri_wavelet(self.detail_output, self.gt)
+                l_total += l_wavelet
+                loss_dict['l_wavelet'] = l_wavelet
             # perceptual loss
             if self.cri_perceptual:
                 l_percep, l_style = self.cri_perceptual(self.output, self.gt)

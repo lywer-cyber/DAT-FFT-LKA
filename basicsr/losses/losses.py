@@ -128,6 +128,47 @@ class HologramSpectrumLoss(nn.Module):
             )
 
 
+def haar_detail_coefficients(x):
+    """Return one-level Haar LH/HL/HH detail coefficients for a 2D image."""
+    if x.ndim != 4 or x.shape[1] != 1:
+        raise ValueError('haar_detail_coefficients expects a Bx1xHxW tensor')
+    if x.shape[-2] % 2 or x.shape[-1] % 2:
+        raise ValueError('Haar detail extraction requires even height and width')
+    x00 = x[..., 0::2, 0::2]
+    x01 = x[..., 0::2, 1::2]
+    x10 = x[..., 1::2, 0::2]
+    x11 = x[..., 1::2, 1::2]
+    lh = (x00 - x01 + x10 - x11) * 0.5
+    hl = (x00 + x01 - x10 - x11) * 0.5
+    hh = (x00 - x01 - x10 + x11) * 0.5
+    return torch.cat([lh, hl, hh], dim=1)
+
+
+@LOSS_REGISTRY.register()
+class HaarWaveletDetailLoss(nn.Module):
+    """L1 loss on predicted and target one-level Haar high-frequency bands."""
+
+    def __init__(self, loss_weight=0.05, reduction='mean'):
+        super().__init__()
+        if reduction not in _reduction_modes:
+            raise ValueError(f'Unsupported reduction mode: {reduction}')
+        self.loss_weight = float(loss_weight)
+        self.reduction = reduction
+
+    def forward(self, pred_detail, target, **kwargs):
+        if pred_detail is None:
+            raise ValueError('HaarWaveletDetailLoss received no detail prediction')
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_detail = pred_detail.float()
+            target_detail = haar_detail_coefficients(target.detach().float())
+            if pred_detail.shape != target_detail.shape:
+                raise ValueError(
+                    'wavelet detail shapes do not match: {} vs {}'.format(
+                        tuple(pred_detail.shape), tuple(target_detail.shape)))
+            return self.loss_weight * F.l1_loss(
+                pred_detail, target_detail, reduction=self.reduction)
+
+
 @LOSS_REGISTRY.register()
 class MSELoss(nn.Module):
     """MSE (L2) loss.

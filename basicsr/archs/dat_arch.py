@@ -803,6 +803,8 @@ class DAT(nn.Module):
                  spatial_mixer_groups=None,
                  lka_kernel_size=7,
                  lka_dilation=3,
+                 wavelet_detail=False,
+                 wavelet_detail_fusion_scale=0.1,
                  **kwargs):
         super().__init__()
 
@@ -830,6 +832,10 @@ class DAT(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
         self.use_bicubic_residual = bool(use_bicubic_residual)
+        self.wavelet_detail = bool(wavelet_detail)
+        self.wavelet_detail_fusion_scale = float(wavelet_detail_fusion_scale)
+        if self.wavelet_detail and (self.upsampler != 'pixelshuffle' or self.upscale != 4):
+            raise ValueError('wavelet_detail currently requires pixelshuffle upsampling with upscale=4')
 
         # ------------------------- 1, Shallow Feature Extraction ------------------------- #
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
@@ -892,12 +898,25 @@ class DAT(nn.Module):
                 nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
             self.upsample = Upsample(upscale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+            if self.wavelet_detail:
+                # Predict the three high-frequency Haar subbands at half the
+                # final resolution (LH, HL, HH).  PixelShuffle(2) maps the
+                # low-resolution reconstruction feature to 128x128 details.
+                self.detail_head = nn.Sequential(
+                    nn.Conv2d(num_feat, 3 * 4, 3, 1, 1),
+                    nn.PixelShuffle(2),
+                )
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR (to save parameters)
             self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch,
                                             (img_size, img_size))
 
         self.apply(self._init_weights)
+        if self.wavelet_detail:
+            # Start as an exact DAT+FFT+LKA baseline.  The new branch learns a
+            # residual only through the wavelet loss and the fused output.
+            nn.init.zeros_(self.detail_head[0].weight)
+            nn.init.zeros_(self.detail_head[0].bias)
         if bool(zero_init_residual_tail):
             if self.upsampler == 'pixelshuffle':
                 nn.init.zeros_(self.conv_last.weight)
@@ -926,7 +945,20 @@ class DAT(nn.Module):
 
         return x
 
-    def forward(self, x):
+    @staticmethod
+    def _haar_detail_inverse(details):
+        """Reconstruct a high-frequency-only image from Haar detail bands."""
+        lh, hl, hh = details[:, 0:1], details[:, 1:2], details[:, 2:3]
+        out = torch.zeros(
+            details.shape[0], 1, details.shape[-2] * 2, details.shape[-1] * 2,
+            device=details.device, dtype=details.dtype)
+        out[..., 0::2, 0::2] = (lh + hl + hh) * 0.5
+        out[..., 0::2, 1::2] = (-lh + hl - hh) * 0.5
+        out[..., 1::2, 0::2] = (lh - hl - hh) * 0.5
+        out[..., 1::2, 1::2] = (-lh - hl + hh) * 0.5
+        return out
+
+    def forward(self, x, return_details=False):
         """
         Input: x: (B, C, H, W)
         """
@@ -934,13 +966,23 @@ class DAT(nn.Module):
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
+        detail_output = None
         if self.upsampler == 'pixelshuffle':
             # for image SR
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.conv_before_upsample(x)
+            if self.wavelet_detail:
+                # Keep coefficients in the same (post-mean, output-space)
+                # units as the ground-truth image used by the loss.
+                detail_output = self.detail_head(x) / self.img_range
             x = self.upsample(x)
             x = self.conv_last(x)
+            if detail_output is not None:
+                detail_residual = self._haar_detail_inverse(detail_output)
+                # The main path is still represented in img_range-scaled
+                # units at this point, so convert the detail residual back.
+                x = x + self.wavelet_detail_fusion_scale * detail_residual * self.img_range
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR
             x = self.conv_first(x)
@@ -955,6 +997,8 @@ class DAT(nn.Module):
                 mode='bicubic',
                 align_corners=False,
             )
+        if return_details:
+            return x, detail_output
         return x
 
 
