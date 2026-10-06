@@ -1,0 +1,134 @@
+# Original DAT with hologram frequency supervision. This is the reference model.
+name: hologram_DAT_x4_fft_8500iter
+model_type: DATModel
+scale: 4
+num_gpu: auto
+manual_seed: 2026
+allow_tf32: true
+
+datasets:
+  train:
+    task: SR
+    name: hologram_x4_train
+    type: HologramIntensityDataset
+    dataroot: /root/autodl-tmp/real_hologram_x4
+    dataset_protocol: lab_like
+    target_dir: hologram_clean
+    gt_size: 256
+    use_hflip: true
+    use_rot: true
+    use_shuffle: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val:
+    task: SR
+    name: hologram_x4_val
+    type: HologramIntensityDataset
+    dataroot: /root/autodl-tmp/real_hologram_x4
+    dataset_protocol: lab_like
+    target_dir: hologram_clean
+    gt_size: ~
+    use_hflip: false
+    use_rot: false
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+
+network_g:
+  type: DAT
+  upscale: 4
+  in_chans: 1
+  img_size: 64
+  img_range: 1.
+  split_size: [8, 32]
+  depth: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  expansion_factor: 4
+  resi_connection: '1conv'
+  upsampler: pixelshuffle
+  use_chk: false
+  use_bicubic_residual: true
+  zero_init_residual_tail: true
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  use_amp: true
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [17000, 21250, 23800]
+    gamma: 0.5
+  total_iter: 25500
+  warmup_iter: -1
+  ema_decay: 0.999
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  frequency_opt:
+    type: HologramSpectrumLoss
+    loss_weight: 0.01
+    min_radius: 0.15
+    max_radius: 0.5
+    correlation_weight: 0.05
+
+val:
+  val_freq: 850
+  save_img: false
+  empty_cuda_cache: false
+  hologram_float_metrics: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: false
+    mae:
+      type: calculate_mae
+      crop_border: 4
+      better: lower
+    rmse:
+      type: calculate_rmse
+      crop_border: 4
+      better: lower
+    spectral_corr:
+      type: calculate_hologram_spectral_corr
+      crop_border: 4
+      min_radius: 0.15
+      max_radius: 0.5
+      better: higher
+    hf_spectral_mae:
+      type: calculate_hologram_hf_mae
+      crop_border: 4
+      min_radius: 0.15
+      max_radius: 0.5
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 850
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+deterministic_training: true
+deterministic_algorithms: false
+
+dist_params:
+  backend: nccl
+  port: 29500
