@@ -568,22 +568,192 @@ class LargeKernelSpatialMixer(nn.Module):
         return self.proj_drop(mixed)
 
 
+class FringeGuidedLargeKernelSpatialMixer(nn.Module):
+    """LKA with feature-derived orientation/frequency-guided directional paths.
+
+    The original isotropic large-kernel path is preserved. Two lightweight
+    depthwise strip-convolution paths provide horizontal/vertical corrections;
+    a local structure-tensor descriptor gates those corrections per pixel.
+    A small residual scale keeps the module close to the original LKA at init.
+    """
+
+    def __init__(self, dim, kernel_size=7, dilation=3, proj_drop=0.):
+        super().__init__()
+        if kernel_size < 3 or kernel_size % 2 == 0:
+            raise ValueError('lka_kernel_size must be an odd integer >= 3')
+        if dilation < 1:
+            raise ValueError('lka_dilation must be a positive integer')
+
+        padding = (kernel_size // 2) * dilation
+        self.local = nn.Conv2d(dim, dim, 5, 1, 2, groups=dim)
+        self.dilated = nn.Conv2d(
+            dim, dim, kernel_size, 1, padding=padding,
+            dilation=dilation, groups=dim)
+        self.horizontal = nn.Conv2d(
+            dim, dim, kernel_size=(1, kernel_size), stride=1,
+            padding=(0, padding), dilation=(1, dilation), groups=dim)
+        self.vertical = nn.Conv2d(
+            dim, dim, kernel_size=(kernel_size, 1), stride=1,
+            padding=(padding, 0), dilation=(dilation, 1), groups=dim)
+
+        self.branch_router = nn.Conv2d(dim + 4, 2, 1)
+        self.attn_proj = nn.Conv2d(dim, dim, 1)
+        self.out_proj = nn.Conv2d(dim, dim, 1)
+        self.residual_scale = nn.Parameter(torch.tensor(0.01))
+        self.proj_drop = nn.Dropout(proj_drop)
+        sobel_x = torch.tensor(
+            [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]) / 8.
+        sobel_y = sobel_x.t().contiguous()
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3), persistent=False)
+
+    def _structure_guide(self, feature):
+        channels = feature.shape[1]
+        sobel_x = self.sobel_x.to(device=feature.device, dtype=feature.dtype)
+        sobel_y = self.sobel_y.to(device=feature.device, dtype=feature.dtype)
+        gx = F.conv2d(feature, sobel_x.expand(channels, 1, 3, 3),
+                      padding=1, groups=channels)
+        gy = F.conv2d(feature, sobel_y.expand(channels, 1, 3, 3),
+                      padding=1, groups=channels)
+
+        jxx = F.avg_pool2d(gx.square().mean(dim=1, keepdim=True), 3, 1, 1)
+        jyy = F.avg_pool2d(gy.square().mean(dim=1, keepdim=True), 3, 1, 1)
+        jxy = F.avg_pool2d((gx * gy).mean(dim=1, keepdim=True), 3, 1, 1)
+        eps = 1e-6
+        discriminant = torch.sqrt((jxx - jyy).square() + 4. * jxy.square() + eps)
+        energy = (jxx + jyy).clamp_min(eps)
+        cos_2theta = (jxx - jyy) / discriminant
+        sin_2theta = (2. * jxy) / discriminant
+        coherence = (discriminant / energy).clamp(0., 1.)
+        relative_frequency = torch.log1p(torch.sqrt(energy))
+        return torch.cat(
+            [cos_2theta, sin_2theta, coherence, relative_frequency], dim=1)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        if N != H * W:
+            raise ValueError('flattened token count does not match H * W')
+
+        feature = x.transpose(1, 2).contiguous().view(B, C, H, W)
+        local = self.local(feature)
+        base = self.dilated(local)
+        guide = self._structure_guide(feature)
+        branch_weights = torch.softmax(
+            self.branch_router(torch.cat([feature, guide], dim=1)), dim=1)
+        directional = (
+            branch_weights[:, 0:1] * self.horizontal(local)
+            + branch_weights[:, 1:2] * self.vertical(local))
+
+        attention = self.attn_proj(base + self.residual_scale * directional)
+        mixed = self.out_proj(feature * attention)
+        mixed = mixed.flatten(2).transpose(1, 2).contiguous()
+        return self.proj_drop(mixed)
+
+
+class FringeGuidedMultiScaleLargeKernelSpatialMixer(nn.Module):
+    """LKA with a shared shallow-feature guide and adaptive multi-scale paths."""
+
+    def __init__(self, dim, kernel_size=7, dilation=3,
+                 branch_dilations=(1, 2, 3), proj_drop=0.):
+        super().__init__()
+        if kernel_size < 3 or kernel_size % 2 == 0:
+            raise ValueError('lka_kernel_size must be an odd integer >= 3')
+        if dilation < 1:
+            raise ValueError('lka_dilation must be a positive integer')
+        branch_dilations = tuple(branch_dilations)
+        if not branch_dilations or any(
+                not isinstance(rate, int) or rate < 1
+                for rate in branch_dilations):
+            raise ValueError('lka_branch_dilations must contain positive integers')
+
+        self.local = nn.Conv2d(dim, dim, 5, 1, 2, groups=dim)
+        self.base_dilated = nn.Conv2d(
+            dim, dim, kernel_size, 1,
+            padding=(kernel_size // 2) * dilation,
+            dilation=dilation, groups=dim)
+        strip_padding = kernel_size // 2
+        self.horizontal = nn.Conv2d(
+            dim, dim, kernel_size=(1, kernel_size), stride=1,
+            padding=(0, strip_padding), groups=dim)
+        self.vertical = nn.Conv2d(
+            dim, dim, kernel_size=(kernel_size, 1), stride=1,
+            padding=(strip_padding, 0), groups=dim)
+        self.dilation_branches = nn.ModuleList([
+            nn.Conv2d(
+                dim, dim, kernel_size, 1,
+                padding=(kernel_size // 2) * rate,
+                dilation=rate, groups=dim)
+            for rate in branch_dilations
+        ])
+
+        # The guide is computed once from DAT.conv_first output and shared by
+        # all replaced LKA blocks. It contains cos(2 theta), sin(2 theta),
+        # structure-tensor coherence, and gradient-energy frequency proxy.
+        self.branch_router = nn.Conv2d(4, 2 + len(branch_dilations), 1)
+        nn.init.zeros_(self.branch_router.weight)
+        nn.init.zeros_(self.branch_router.bias)
+        self.attn_proj = nn.Conv2d(dim, dim, 1)
+        self.out_proj = nn.Conv2d(dim, dim, 1)
+        self.residual_scale = nn.Parameter(torch.tensor(0.01))
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, H, W, shallow_guide):
+        B, N, C = x.shape
+        if N != H * W:
+            raise ValueError('flattened token count does not match H * W')
+        if shallow_guide is None:
+            raise ValueError('fringe-guided multi-scale LKA requires shallow_guide')
+        if shallow_guide.shape[0] != B or shallow_guide.shape[1] != 4:
+            raise ValueError('shallow_guide must have shape (B, 4, H, W)')
+        if shallow_guide.shape[-2:] != (H, W):
+            shallow_guide = F.interpolate(
+                shallow_guide, size=(H, W), mode='bilinear', align_corners=False)
+
+        feature = x.transpose(1, 2).contiguous().view(B, C, H, W)
+        local = self.local(feature)
+        base = self.base_dilated(local)
+        branch_weights = torch.softmax(self.branch_router(shallow_guide), dim=1)
+        branches = [self.horizontal(local), self.vertical(local)]
+        branches.extend(branch(local) for branch in self.dilation_branches)
+        correction = sum(
+            branch_weights[:, idx:idx + 1] * branch_value
+            for idx, branch_value in enumerate(branches))
+
+        attention = self.attn_proj(base + self.residual_scale * correction)
+        mixed = self.out_proj(feature * attention)
+        mixed = mixed.flatten(2).transpose(1, 2).contiguous()
+        return self.proj_drop(mixed)
+
+
 class DATB(nn.Module):
     def __init__(self, dim, num_heads, reso=64, split_size=[2,4],shift_size=[1,2], expansion_factor=4., qkv_bias=False, qk_scale=None, drop=0.,
                  attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, rg_idx=0, b_idx=0,
                  spatial_mixer='dat', spatial_mixer_groups=None, lka_kernel_size=7,
-                 lka_dilation=3):
+                 lka_dilation=3, lka_branch_dilations=(1, 2, 3)):
         super().__init__()
 
         self.norm1 = norm_layer(dim)
         spatial_mixer_groups = set(spatial_mixer_groups or [])
 
         if b_idx % 2 == 0:
-            replace_dstb = spatial_mixer == 'large_kernel' and rg_idx in spatial_mixer_groups
+            replace_dstb = spatial_mixer in (
+                'large_kernel', 'fringe_guided', 'fringe_guided_multiscale'
+            ) and rg_idx in spatial_mixer_groups
             if replace_dstb:
-                self.attn = LargeKernelSpatialMixer(
-                    dim=dim, kernel_size=lka_kernel_size,
-                    dilation=lka_dilation, proj_drop=drop)
+                if spatial_mixer == 'fringe_guided':
+                    self.attn = FringeGuidedLargeKernelSpatialMixer(
+                        dim=dim, kernel_size=lka_kernel_size,
+                        dilation=lka_dilation, proj_drop=drop)
+                elif spatial_mixer == 'fringe_guided_multiscale':
+                    self.attn = FringeGuidedMultiScaleLargeKernelSpatialMixer(
+                        dim=dim, kernel_size=lka_kernel_size,
+                        dilation=lka_dilation,
+                        branch_dilations=lka_branch_dilations,
+                        proj_drop=drop)
+                else:
+                    self.attn = LargeKernelSpatialMixer(
+                        dim=dim, kernel_size=lka_kernel_size,
+                        dilation=lka_dilation, proj_drop=drop)
             else:
                 # Original DSTB
                 self.attn = Adaptive_Spatial_Attention(
@@ -602,13 +772,18 @@ class DATB(nn.Module):
         self.ffn = SGFN(in_features=dim, hidden_features=ffn_hidden_dim, out_features=dim, act_layer=act_layer)
         self.norm2 = norm_layer(dim)
 
-    def forward(self, x, x_size):
+    def forward(self, x, x_size, shallow_guide=None):
         """
         Input: x: (B, H*W, C), x_size: (H, W)
         Output: x: (B, H*W, C)
         """        
         H , W = x_size
-        x = x + self.drop_path(self.attn(self.norm1(x), H, W))
+        normalized = self.norm1(x)
+        if isinstance(self.attn, FringeGuidedMultiScaleLargeKernelSpatialMixer):
+            attention = self.attn(normalized, H, W, shallow_guide)
+        else:
+            attention = self.attn(normalized, H, W)
+        x = x + self.drop_path(attention)
         x = x + self.drop_path(self.ffn(self.norm2(x), H, W))
 
         return x
@@ -653,7 +828,8 @@ class ResidualGroup(nn.Module):
                     spatial_mixer='dat',
                     spatial_mixer_groups=None,
                     lka_kernel_size=7,
-                    lka_dilation=3):
+                    lka_dilation=3,
+                    lka_branch_dilations=(1, 2, 3)):
         super().__init__()
         self.use_chk = use_chk
         self.reso = reso
@@ -680,6 +856,7 @@ class ResidualGroup(nn.Module):
             spatial_mixer_groups=spatial_mixer_groups,
             lka_kernel_size=lka_kernel_size,
             lka_dilation=lka_dilation,
+            lka_branch_dilations=lka_branch_dilations,
             )for i in range(depth)])
 
         if resi_connection == '1conv':
@@ -690,7 +867,7 @@ class ResidualGroup(nn.Module):
                 nn.Conv2d(dim // 4, dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
                 nn.Conv2d(dim // 4, dim, 3, 1, 1))
 
-    def forward(self, x, x_size):
+    def forward(self, x, x_size, shallow_guide=None):
         """
         Input: x: (B, H*W, C), x_size: (H, W)
         Output: x: (B, H*W, C)
@@ -701,9 +878,13 @@ class ResidualGroup(nn.Module):
             # Checkpointing is only useful while autograd is active. During
             # validation it emits warnings and adds unnecessary recomputation.
             if self.use_chk and self.training and torch.is_grad_enabled():
-                x = checkpoint.checkpoint(blk, x, x_size)
+                if shallow_guide is None:
+                    x = checkpoint.checkpoint(blk, x, x_size)
+                else:
+                    x = checkpoint.checkpoint(
+                        blk, x, x_size, shallow_guide, use_reentrant=False)
             else:
-                x = blk(x, x_size)
+                x = blk(x, x_size, shallow_guide)
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
         x = self.conv(x)
         x = rearrange(x, "b c h w -> b (h w) c")
@@ -803,11 +984,16 @@ class DAT(nn.Module):
                  spatial_mixer_groups=None,
                  lka_kernel_size=7,
                  lka_dilation=3,
+                 lka_branch_dilations=(1, 2, 3),
                  **kwargs):
         super().__init__()
 
-        if spatial_mixer not in ('dat', 'large_kernel'):
-            raise ValueError("spatial_mixer must be 'dat' or 'large_kernel'")
+        if spatial_mixer not in (
+                'dat', 'large_kernel', 'fringe_guided',
+                'fringe_guided_multiscale'):
+            raise ValueError(
+                "spatial_mixer must be 'dat', 'large_kernel', 'fringe_guided', "
+                "or 'fringe_guided_multiscale'")
         spatial_mixer_groups = list(spatial_mixer_groups or [])
         invalid_groups = [idx for idx in spatial_mixer_groups
                            if not isinstance(idx, int) or idx < 0 or idx >= len(depth)]
@@ -817,6 +1003,11 @@ class DAT(nn.Module):
             raise ValueError('lka_kernel_size must be an odd integer >= 3')
         if not isinstance(lka_dilation, int) or lka_dilation < 1:
             raise ValueError('lka_dilation must be a positive integer')
+        lka_branch_dilations = tuple(lka_branch_dilations)
+        if not lka_branch_dilations or any(
+                not isinstance(rate, int) or rate < 1
+                for rate in lka_branch_dilations):
+            raise ValueError('lka_branch_dilations must contain positive integers')
 
         num_in_ch = in_chans
         num_out_ch = in_chans
@@ -830,6 +1021,15 @@ class DAT(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
         self.use_bicubic_residual = bool(use_bicubic_residual)
+        self.spatial_mixer = spatial_mixer
+
+        sobel_x = torch.tensor(
+            [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]) / 8.
+        self.register_buffer(
+            'fringe_sobel_x', sobel_x.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer(
+            'fringe_sobel_y', sobel_x.t().contiguous().view(1, 1, 3, 3),
+            persistent=False)
 
         # ------------------------- 1, Shallow Feature Extraction ------------------------- #
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
@@ -871,6 +1071,7 @@ class DAT(nn.Module):
                 spatial_mixer_groups=spatial_mixer_groups,
                 lka_kernel_size=lka_kernel_size,
                 lka_dilation=lka_dilation,
+                lka_branch_dilations=lka_branch_dilations,
                 )
             self.layers.append(layer)
 
@@ -915,12 +1116,36 @@ class DAT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward_features(self, x):
+    def _make_shallow_fringe_guide(self, shallow_feature):
+        channels = shallow_feature.shape[1]
+        with torch.autocast(device_type=shallow_feature.device.type, enabled=False):
+            feature = shallow_feature.float()
+            sobel_x = self.fringe_sobel_x.to(device=feature.device, dtype=feature.dtype)
+            sobel_y = self.fringe_sobel_y.to(device=feature.device, dtype=feature.dtype)
+            gx = F.conv2d(feature, sobel_x.expand(channels, 1, 3, 3),
+                          padding=1, groups=channels)
+            gy = F.conv2d(feature, sobel_y.expand(channels, 1, 3, 3),
+                          padding=1, groups=channels)
+            jxx = F.avg_pool2d(gx.square().mean(dim=1, keepdim=True), 3, 1, 1)
+            jyy = F.avg_pool2d(gy.square().mean(dim=1, keepdim=True), 3, 1, 1)
+            jxy = F.avg_pool2d((gx * gy).mean(dim=1, keepdim=True), 3, 1, 1)
+            eps = 1e-8
+            discriminant = torch.sqrt((jxx - jyy).square() + 4. * jxy.square() + eps)
+            energy = (jxx + jyy).clamp_min(eps)
+            cos_2theta = (jxx - jyy) / discriminant
+            sin_2theta = (2. * jxy) / discriminant
+            coherence = (discriminant / energy).clamp(0., 1.)
+            relative_frequency = torch.log1p(torch.sqrt(energy))
+            guide = torch.cat(
+                [cos_2theta, sin_2theta, coherence, relative_frequency], dim=1)
+        return guide.to(dtype=shallow_feature.dtype)
+
+    def forward_features(self, x, shallow_guide=None):
         _, _, H, W = x.shape
         x_size = [H, W]
         x = self.before_RG(x)
         for layer in self.layers:
-            x = layer(x, x_size)
+            x = layer(x, x_size, shallow_guide)
         x = self.norm(x)
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
 
@@ -937,14 +1162,22 @@ class DAT(nn.Module):
         if self.upsampler == 'pixelshuffle':
             # for image SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            shallow_guide = (
+                self._make_shallow_fringe_guide(x)
+                if self.spatial_mixer == 'fringe_guided_multiscale' else None)
+            x = self.conv_after_body(
+                self.forward_features(x, shallow_guide)) + x
             x = self.conv_before_upsample(x)
             x = self.upsample(x)
             x = self.conv_last(x)
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            shallow_guide = (
+                self._make_shallow_fringe_guide(x)
+                if self.spatial_mixer == 'fringe_guided_multiscale' else None)
+            x = self.conv_after_body(
+                self.forward_features(x, shallow_guide)) + x
             x = self.upsample(x)
 
         x = x / self.img_range + self.mean
