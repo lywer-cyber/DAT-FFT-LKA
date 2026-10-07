@@ -902,10 +902,15 @@ class DAT(nn.Module):
                 # Predict the three high-frequency Haar subbands at half the
                 # final resolution (LH, HL, HH).  PixelShuffle(2) maps the
                 # low-resolution reconstruction feature to 128x128 details.
+                # Restore the RNG state after Conv2d's default initialization:
+                # adding this branch must not change the baseline DAT weights
+                # or the subsequent data-shuffle RNG sequence.
+                rng_state = torch.get_rng_state()
                 self.detail_head = nn.Sequential(
                     nn.Conv2d(num_feat, 3 * 4, 3, 1, 1),
                     nn.PixelShuffle(2),
                 )
+                torch.set_rng_state(rng_state)
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR (to save parameters)
             self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch,
