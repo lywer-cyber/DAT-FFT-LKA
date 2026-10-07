@@ -108,11 +108,14 @@ class SRModel(BaseModel):
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            network_output = self.net_g(self.lq, return_details=True)
-            if isinstance(network_output, tuple):
+            if self.cri_wavelet:
+                network_output = self.net_g(self.lq, return_details=True)
+                if not isinstance(network_output, tuple) or len(network_output) != 2:
+                    raise RuntimeError(
+                        'wavelet_opt requires network_g to return (image, detail_coefficients)')
                 self.output, self.detail_output = network_output
             else:
-                self.output = network_output
+                self.output = self.net_g(self.lq)
                 self.detail_output = None
 
             l_total = 0
