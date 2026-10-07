@@ -710,6 +710,78 @@ class ResidualGroup(nn.Module):
         return res + x
 
 
+class ConvNeXtLiteBlock(nn.Module):
+    """Small ConvNeXt-style block for hologram multi-scale aggregation.
+
+    The block operates on BCHW tensors.  It is deliberately kept separate
+    from DATB/LKA so the original attention path is unchanged.
+    """
+
+    def __init__(self, dim, expansion=2):
+        super().__init__()
+        hidden_dim = int(dim * expansion)
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(hidden_dim, dim)
+        self.gamma = nn.Parameter(torch.ones(dim) * 1e-6)
+
+    def forward(self, x):
+        residual = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = self.norm(x)
+        x = self.pwconv2(self.act(self.pwconv1(x)))
+        x = self.gamma * x
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return residual + x
+
+
+class HierarchicalMultiScaleAggregator(nn.Module):
+    """Aggregate stage-2/4/6 DAT features with pooled multi-scale context.
+
+    All DAT residual groups retain the original spatial resolution.  The
+    early and middle features are pooled before their ConvNeXt-lite blocks,
+    then resized back and fused with the final-stage feature.  The outer
+    residual scale is zero-initialized so enabling this module starts exactly
+    at the original DAT+FFT+LKA function.
+    """
+
+    def __init__(self, dim, fusion_scale=0.1):
+        super().__init__()
+        self.low_block = ConvNeXtLiteBlock(dim)
+        self.mid_block = ConvNeXtLiteBlock(dim)
+        self.high_block = ConvNeXtLiteBlock(dim)
+        self.merge = nn.Conv2d(dim * 3, dim, kernel_size=1)
+        gate_hidden = max(dim // 4, 16)
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, gate_hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(gate_hidden, dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.fusion_scale = nn.Parameter(torch.tensor(0.0))
+        self.fusion_scale_limit = float(fusion_scale)
+
+    def forward(self, stage2, stage4, stage6):
+        height, width = stage6.shape[-2:]
+        low = F.avg_pool2d(stage2, kernel_size=2, stride=2)
+        mid = F.avg_pool2d(stage4, kernel_size=2, stride=2)
+        low = F.interpolate(low, size=(height, width), mode='bilinear', align_corners=False)
+        mid = F.interpolate(mid, size=(height, width), mode='bilinear', align_corners=False)
+        low = self.low_block(low)
+        mid = self.mid_block(mid)
+        high = self.high_block(stage6)
+        fused = self.merge(torch.cat([low, mid, high], dim=1))
+        fused = fused * self.channel_gate(fused)
+        # The parameter starts at exactly zero; the configured scale controls
+        # the residual branch's initial learning range without perturbing the
+        # baseline function at initialization.
+        return stage6 + self.fusion_scale_limit * self.fusion_scale * fused
+
+
 class Upsample(nn.Sequential):
     """Upsample module.
     Args:
@@ -803,6 +875,9 @@ class DAT(nn.Module):
                  spatial_mixer_groups=None,
                  lka_kernel_size=7,
                  lka_dilation=3,
+                 multiscale_hierarchical=False,
+                 multiscale_stages=(1, 3, 5),
+                 multiscale_fusion_scale=0.1,
                  **kwargs):
         super().__init__()
 
@@ -817,6 +892,13 @@ class DAT(nn.Module):
             raise ValueError('lka_kernel_size must be an odd integer >= 3')
         if not isinstance(lka_dilation, int) or lka_dilation < 1:
             raise ValueError('lka_dilation must be a positive integer')
+        self.multiscale_hierarchical = bool(multiscale_hierarchical)
+        self.multiscale_stages = tuple(int(v) for v in multiscale_stages)
+        if self.multiscale_hierarchical:
+            if self.multiscale_stages != (1, 3, 5):
+                raise ValueError('multiscale_stages must be (1, 3, 5): stage 2/4/6')
+            if len(depth) != 6:
+                raise ValueError('multiscale_hierarchical requires six DAT stages')
 
         num_in_ch = in_chans
         num_out_ch = in_chans
@@ -874,6 +956,15 @@ class DAT(nn.Module):
                 )
             self.layers.append(layer)
 
+        if self.multiscale_hierarchical:
+            # Create the new branch after the DAT/LKA layers.  Its random
+            # initialization must not consume RNG state used by the baseline
+            # network or the deterministic data pipeline.
+            rng_state = torch.get_rng_state()
+            self.multiscale_aggregator = HierarchicalMultiScaleAggregator(
+                embed_dim, fusion_scale=multiscale_fusion_scale)
+            torch.set_rng_state(rng_state)
+
         self.norm = norm_layer(curr_dim)
         # build the last conv layer in deep feature extraction
         if resi_connection == '1conv':
@@ -919,8 +1010,19 @@ class DAT(nn.Module):
         _, _, H, W = x.shape
         x_size = [H, W]
         x = self.before_RG(x)
+        stage_features = []
         for layer in self.layers:
             x = layer(x, x_size)
+            if self.multiscale_hierarchical:
+                stage_features.append(
+                    rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous())
+        if self.multiscale_hierarchical:
+            x = self.multiscale_aggregator(
+                stage_features[self.multiscale_stages[0]],
+                stage_features[self.multiscale_stages[1]],
+                stage_features[self.multiscale_stages[2]],
+            )
+            x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         x = self.norm(x)
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
 
